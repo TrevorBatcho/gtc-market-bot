@@ -1,141 +1,222 @@
-# send_once.py  — upgraded (pairs + % alerts + optional news)
-import os, time, requests, datetime
+# send_once.py  — GTC Market Bot (daily + alerts)
+# ------------------------------------------------
+# Env needed:
+#  TELEGRAM_TOKEN   -> Bot token (from BotFather)
+#  CHANNEL_ID       -> Telegram channel/chat id (e.g., -1001234567890)
+#  ALPHA_VANTAGE_KEY-> Alpha Vantage API key
+#  NEWS_API_KEY     -> (optional) NewsAPI.org key
+#  RUN_MODE         -> "daily" or "alert"  (default = "alert")
 
-TOKEN  = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHANNEL_ID")         # e.g., -1001234567890
-API_KEY = os.getenv("ALPHA_VANTAGE_KEY")
-NEWS_KEY = os.getenv("NEWS_API_KEY")      # optional (add in GitHub Secrets if you want headlines)
-RUN_MODE = os.getenv("RUN_MODE", "alert") # "alert" or "daily"
-THRESHOLD = float(os.getenv("MOVETHRESH_PCT", "0.5"))  # % move to trigger alert
+import os
+import time
+import datetime as dt
+import requests
+from typing import List, Tuple, Optional
 
-# === Customize your pairs here ===
-# Use 3-letter codes (FX / metals like XAU). All priced vs USD.
-WATCHLIST = [
-    ("EUR","USD"),
-    ("GBP","USD"),
-    ("USD","JPY"),
-    ("XAU","USD"),  # Gold
-    # ("BTC","USD"),  # If you want crypto alerts, comment in & see note below
+# ========= EDITABLE CONFIG =========
+PAIRS: List[Tuple[str, str]] = [
+    ("EUR", "USD"),
+    ("GBP", "USD"),
+    ("USD", "JPY"),
+    ("XAU", "USD"),   # Gold priced in USD (Alpha Vantage supports this)
+    # ("USD","LKR"),
 ]
 
-# ---------- Helpers ----------
-def send_message_html(text: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    r = requests.post(url, data=payload, timeout=30)
-    ok = r.ok
-    if not ok:
-        print("Send failed:", r.text)
-    return ok
+# Alerts mode: send only if abs(% move) >= threshold from prior hour bar
+ALERT_THRESHOLD_PCT: float = 0.5  # e.g. 0.5%  -> send only if move >= 0.5%
 
-def fx_spot(from_cur, to_cur="USD"):
-    """Realtime FX spot (or metals like XAU)"""
-    url = ( "https://www.alphavantage.co/query"
-            f"?function=CURRENCY_EXCHANGE_RATE&from_currency={from_cur}&to_currency={to_cur}&apikey={API_KEY}")
-    j = requests.get(url, timeout=30).json()
+# News (used in daily mode). Set HEADLINES_LIMIT=0 to disable quickly.
+HEADLINES_QUERY: str = "forex OR eurusd OR gbpusd OR usdjpy OR gold"
+HEADLINES_SOURCES: List[str] = ["bloomberg.com", "reuters.com", "wsj.com", "ft.com"]
+HEADLINES_LIMIT: int = 3
+# ===================================
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHANNEL_ID")
+API_KEY = os.getenv("ALPHA_VANTAGE_KEY")
+NEWS_KEY = os.getenv("NEWS_API_KEY")  # optional
+
+if not TOKEN or not CHAT_ID or not API_KEY:
+    raise SystemExit("Missing TELEGRAM_TOKEN, CHANNEL_ID or ALPHA_VANTAGE_KEY")
+
+TG_API = f"https://api.telegram.org/bot{TOKEN}"
+AV_BASE = "https://www.alphavantage.co/query"
+
+def _ts_utc() -> str:
+    return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+def send_message(text: str, disable_web_page_preview: bool = True) -> None:
+    url = f"{TG_API}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_web_page_preview,
+    }
+    r = requests.post(url, data=payload, timeout=20)
+    if not r.ok:
+        print("Telegram send failed:", r.text)
+        raise SystemExit(1)
+
+def fetch_fx_spot(from_cur: str, to_cur: str) -> Optional[float]:
+    """Realtime spot via CURRENCY_EXCHANGE_RATE. Returns float or None."""
+    params = {
+        "function": "CURRENCY_EXCHANGE_RATE",
+        "from_currency": from_cur,
+        "to_currency": to_cur,
+        "apikey": API_KEY,
+    }
     try:
-        return float(j["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
-    except Exception:
+        r = requests.get(AV_BASE, params=params, timeout=20)
+        j = r.json()
+        d = j.get("Realtime Currency Exchange Rate", {})
+        rate_str = d.get("5. Exchange Rate")
+        return float(rate_str) if rate_str else None
+    except Exception as e:
+        print("fetch_fx_spot error", from_cur, to_cur, e)
         return None
 
-def fx_intraday_latest_and_past(from_cur, to_cur="USD", minutes_back=60):
+def fetch_fx_change(from_cur: str, to_cur: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    Intraday 5-min series (FX only).
-    Returns (latest_price, price_~minutes_back) if possible.
+    Returns (spot, pct_change) using intraday 60m bars:
+      pct_change = (last_close / prev_close - 1) * 100
+    Falls back to spot only if intraday unavailable.
     """
-    url = ( "https://www.alphavantage.co/query"
-            f"?function=FX_INTRADAY&from_symbol={from_cur}&to_symbol={to_cur}"
-            f"&interval=5min&outputsize=compact&apikey={API_KEY}")
-    j = requests.get(url, timeout=30).json()
-    series = j.get("Time Series FX (5min)") or {}
-    if not series:
-        return None, None
-    # Sort newest → oldest
-    times = sorted(series.keys(), reverse=True)
-    latest_time = times[0]
-    latest = float(series[latest_time]["4. close"])
-    # approx index for 60 min back = 12 bars (5-min * 12)
-    idx = min(len(times)-1, 12)
-    past = float(series[times[idx]]["4. close"])
-    return latest, past
-
-def pct_change(new, old):
-    return (new - old) / old * 100.0 if (new is not None and old) else None
-
-def fmt(from_cur, to_cur, p):
-    # Show more decimals for JPY; 4 dp for others
-    if to_cur in ("JPY",):
-        return f"{from_cur}/{to_cur}: {p:,.3f}"
-    return f"{from_cur}/{to_cur}: {p:,.4f}"
-
-def get_headlines(n=3):
-    """Optional: top 3 finance headlines (needs NEWS_API_KEY secret)."""
-    if not NEWS_KEY:
-        return []
+    # First, try intraday 60min
+    params = {
+        "function": "FX_INTRADAY",
+        "from_symbol": from_cur,
+        "to_symbol": to_cur,
+        "interval": "60min",
+        "outputsize": "compact",
+        "apikey": API_KEY,
+    }
     try:
-        # Simple query; adjust language/country if you want
-        url = ("https://newsapi.org/v2/top-headlines?"
-               "category=business&language=en&pageSize=3")
-        r = requests.get(url, headers={"X-Api-Key": NEWS_KEY}, timeout=30).json()
-        arts = r.get("articles") or []
+        r = requests.get(AV_BASE, params=params, timeout=20)
+        j = r.json()
+        series = j.get("Time Series FX (60min)")
+        if isinstance(series, dict) and len(series) >= 2:
+            # Sort timestamps desc, pick latest two closes
+            keys = sorted(series.keys(), reverse=True)
+            last = float(series[keys[0]]["4. close"])
+            prev = float(series[keys[1]]["4. close"])
+            pct = ((last / prev) - 1.0) * 100.0
+            return last, pct
+    except Exception as e:
+        print("fetch_fx_change intraday error", from_cur, to_cur, e)
+
+    # Fallback: get realtime spot only (no change)
+    spot = fetch_fx_spot(from_cur, to_cur)
+    return spot, None
+
+def fmt_pair(from_cur: str, to_cur: str) -> str:
+    return f"{from_cur}/{to_cur}"
+
+def build_daily_text() -> str:
+    header = f"📊 <b>GTC Academy — Daily Market Snapshot</b>\n{_ts_utc()}\n\n"
+    lines = []
+    for a, b in PAIRS:
+        spot = fetch_fx_spot(a, b)
+        if spot is None:
+            lines.append(f"• {fmt_pair(a,b)}: n/a")
+        else:
+            # format with sensible decimals
+            if b in ("JPY"):  # JPY quotes often ~3 decimals
+                lines.append(f"• {fmt_pair(a,b)}: {spot:.3f}")
+            else:
+                lines.append(f"• {fmt_pair(a,b)}: {spot:.5f}")
+
+        # Respect Alpha Vantage rate limit (5 req/min on free tier)
+        time.sleep(12)
+
+    text = header + "\n".join(lines)
+
+    # Optional headlines
+    if NEWS_KEY and HEADLINES_LIMIT > 0:
+        heads = fetch_headlines(HEADLINES_QUERY, HEADLINES_SOURCES, HEADLINES_LIMIT)
+        if heads:
+            text += "\n\n🗞 <b>Top Headlines</b>\n"
+            for title, source in heads:
+                text += f"• {title} <i>({source})</i>\n"
+
+    return text
+
+def fetch_headlines(query: str, sources: List[str], limit: int) -> List[Tuple[str, str]]:
+    """
+    Simple NewsAPI.org query. Returns list of (title, source) — no links printed.
+    """
+    try:
+        params = {
+            "q": query,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": limit,
+            "apiKey": NEWS_KEY,
+        }
+        if sources:
+            params["domains"] = ",".join(sources)
+        r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=20)
+        j = r.json()
+        arts = j.get("articles", [])[:limit]
         out = []
-        for a in arts[:n]:
-            title = a.get("title") or ""
-            src = a.get("source",{}).get("name","")
-            out.append(f"• {title} <i>({src})</i>")
+        for a in arts:
+            title = a.get("title") or "Headline"
+            source = (a.get("source") or {}).get("name") or "News"
+            out.append((title, source))
         return out
     except Exception as e:
-        print("News fetch error:", e)
+        print("fetch_headlines error:", e)
         return []
 
-# ---------- Main modes ----------
-def run_daily():
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    header = f"📊 <b>GTC Academy — Daily Market Snapshot</b>\n{ts}\n\n"
-    lines = []
-    for (a,b) in WATCHLIST:
-        p = fx_spot(a,b)
-        if p is None:
-            lines.append(f"• {a}/{b}: n/a")
-        else:
-            lines.append(f"• {fmt(a,b,p)}")
-        time.sleep(15)  # Alpha Vantage free limit: be gentle
-    # optional headlines
-    headlines = get_headlines(3)
-    if headlines:
-        lines.append("\n📰 <b>Top Headlines</b>")
-        lines.extend(headlines)
-    text = header + "\n".join(lines)
-    ok = send_message_html(text)
-    if ok:
-        print("Daily sent OK")
+def build_alert_text(threshold_pct: float) -> Optional[str]:
+    """
+    Build an alert only for pairs with |% change| >= threshold_pct using intraday 60m bars.
+    If none qualify, return None (so the workflow doesn't spam).
+    """
+    header = f"🔔 <b>GTC Market Alert</b>\n{_ts_utc()}\n\n"
+    chosen = []
+    for a, b in PAIRS:
+        spot, pct = fetch_fx_change(a, b)
 
-def run_alert():
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    header = f"🔔 <b>GTC Market Alert</b>\n{ts}\n"
-    alerts = []
-    for (a,b) in WATCHLIST:
-        latest, past = fx_intraday_latest_and_past(a,b, minutes_back=60)
-        if latest is None or past is None:
-            print(f"{a}/{b}: intraday data n/a")
+        # Respect Alpha Vantage throughput
+        time.sleep(12)
+
+        # Skip if we couldn't fetch anything
+        if spot is None:
+            continue
+
+        move_str = ""
+        if pct is not None:
+            sign = "▲" if pct >= 0 else "▼"
+            move_str = f" ({sign}{abs(pct):.2f}%)"
+            if abs(pct) < threshold_pct:
+                continue  # do not alert if under threshold
+        # else: intraday change unavailable — skip from alerts to avoid noise
         else:
-            move = pct_change(latest, past)
-            if move is not None and abs(move) >= THRESHOLD:
-                arrow = "🔺" if move > 0 else "🔻"
-                alerts.append(f"{arrow} {fmt(a,b,latest)}  ({move:.2f}% in ~1h)")
-        time.sleep(15)  # rate limit protection
-    if alerts:
-        text = header + "\n".join(alerts)
-        ok = send_message_html(text)
-        if ok:
-            print("Alert(s) sent OK")
+            continue
+
+        if b in ("JPY"):
+            chosen.append(f"• {fmt_pair(a,b)}: {spot:.3f}{move_str}")
+        else:
+            chosen.append(f"• {fmt_pair(a,b)}: {spot:.5f}{move_str}")
+
+    if not chosen:
+        return None
+    return header + "\n".join(chosen)
+
+def main(mode: str = "alert") -> None:
+    mode = (mode or "alert").lower()
+    if mode == "daily":
+        text = build_daily_text()
+        send_message(text)
+        print("Daily sent.")
     else:
-        print("No alerts ≥ threshold this run.")
+        text = build_alert_text(ALERT_THRESHOLD_PCT)
+        if text:
+            send_message(text)
+            print("Alert sent.")
+        else:
+            print("No pairs exceeded threshold; no alert sent.")
 
 if __name__ == "__main__":
-    if not (TOKEN and CHAT_ID and API_KEY):
-        raise SystemExit("Missing TELEGRAM_TOKEN / CHANNEL_ID / ALPHA_VANTAGE_KEY")
-    if RUN_MODE == "daily":
-        run_daily()
-    else:
-        run_alert()
+    main(os.getenv("RUN_MODE", "alert"))

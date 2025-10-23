@@ -1,0 +1,28 @@
+name: Charts (Daily 08:30 Dubai)
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # 04:30 UTC = 08:30 Dubai
+  workflow_dispatch: {}
+
+jobs:
+  charts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run chart mode
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+          RUN_MODE: chart
+        run: |
+          python send_once.py
